@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 import socket
+import fcntl
+import array
 from multiprocessing import Process, Queue, Event
 import signal
 import sys
 import yaml
-from struct import pack as s_pack
+from struct import pack as s_pack, unpack as s_unpack
 import time
 import binascii
 import cProfile
@@ -34,16 +36,35 @@ class multicast_socket(Process):
 
         group = socket.inet_aton(self.address)
         if iface_ip is None:
-            mreq = s_pack('=4sl', group, socket.INADDR_ANY)
+            mreq = s_pack('4sl', group, socket.INADDR_ANY)
         else:
-            # 
-            print iface_ip
+            #print iface_ip
             mreq = group + socket.inet_aton(iface_ip)
             self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(iface_ip))
 
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
         self.sock.bind((self.address,self.port))
+
+    @staticmethod
+    def enumerate_interfaces():
+        max_interfaces = 128  # arbitrary. raise if needed.
+        max_bytes = max_interfaces * 32
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        names = array.array('B', '\0' * max_bytes)
+        outbytes = s_unpack('iL', fcntl.ioctl(
+            s.fileno(),
+            0x8912,  # SIOCGIFCONF
+            s_pack('iL', max_bytes, names.buffer_info()[0])
+        ))[0]
+        namestr = names.tostring()
+        interfaces = []
+        for i in range(0, outbytes, 40):
+            name = namestr[i:i+16].split('\0', 1)[0]
+            raw_ip   = namestr[i+20:i+24]
+            ip = "%u.%u.%u.%u" % (ord(raw_ip[0]), ord(raw_ip[1]), ord(raw_ip[2]), ord(raw_ip[3]))
+            interfaces.append((name, ip))
+        return interfaces
 
     def close(self):
         self.sock.close()
@@ -81,6 +102,13 @@ class multicast_socket(Process):
         print "Stopping multicast socket %s..."%(self.name)
         self.alive.clear()
         self.sock.close()
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.stop()
 
 # A class for interpreting incoming bytes as a scan data frame produced by the br24 radar. It just
 # tries to create scanlines out of the incoming bytes
@@ -237,7 +265,7 @@ class br24_frame_decoder:
         self.restore_from_local_copy(state,scanline_idx,num_scanlines,scanline_size,scanline_header_size,curr_sc,scanline_header,scanline_data)
 
 # A driver for the BR24 radar! This
-class br24(Process): 
+class br24(Process):
     # COMMANDS
     CMD_POWER_1 = '\x00\xc1'
     CMD_POWER_2 = '\x01\xc1'
@@ -269,6 +297,13 @@ class br24(Process):
         Process.__init__(self)
         self.data_q = Queue()
 
+        if interface_ip == None:
+            print "Starting Automatic radar discovery..."
+            interface_name, interface_ip = self._discover_radar_interface()
+            if interface_ip == None:
+                raise RadarNotFound
+            print "Radar discovered on " + interface_name
+
         self.scan_data_socket = multicast_socket('236.6.7.8', 6678, data_q = self.data_q, name="scan_data", iface_ip = interface_ip)
         self.command_response_socket = multicast_socket('236.6.7.9', 6679, name="command_response", iface_ip = interface_ip)
         self.command_request_socket = multicast_socket('236.6.7.10', 6680, name="command_request", iface_ip = interface_ip)
@@ -280,6 +315,23 @@ class br24(Process):
 
         self.scan_data_socket.start()
         self.scan_data_decoder = br24_frame_decoder()
+
+    def _discover_radar_interface(self):
+        interfaces = multicast_socket.enumerate_interfaces()
+        while True:
+            for interface_name, interface_ip in interfaces:
+                with multicast_socket('236.6.7.15', 6659, name="discovery-"+interface_name, iface_ip = interface_ip, data_q = Queue()) as interface_discovery_socket :
+                    time.sleep(3)
+                    if(interface_discovery_socket.data_ready()):
+                        data = interface_discovery_socket.read()
+                        print "read: "+repr(data)
+                        if(data[0:2] == '\x01\xc4'):
+                            print interface_name
+                            print interface_ip
+                            print repr(data)
+                            return (interface_name, interface_ip)
+
+        return (None, None)
 
     ### COMMAND SOCKET METHODS ###
     def send_command(self,cmd,value=''):
